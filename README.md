@@ -1,25 +1,54 @@
-[![Build Status](https://secure.travis-ci.org/knyar/nginx-lua-prometheus.svg?branch=master)](http://travis-ci.org/knyar/nginx-lua-prometheus?branch=master)
-[![Coverage Status](https://coveralls.io/repos/github/knyar/nginx-lua-prometheus/badge.svg?branch=master)](https://coveralls.io/github/knyar/nginx-lua-prometheus?branch=master)
+# Prometheus metric library for OpenComputers
 
-# Prometheus metric library for Nginx
+This is a Lua library that can be used with OpenComputers in Minecraft to keep
+track of metrics and push them to [Prometheus](https://prometheus.io)
+Pushgateway.
 
-This is a Lua library that can be used with Nginx to keep track of metrics and
-expose them on a separate web page to be pulled by
-[Prometheus](https://prometheus.io).
+WARNING: it's still in "I just got it working" state, so there are some sharp
+edges.
 
 ## Installation
 
-You need to install nginx package with lua support (`libnginx-mod-http-lua` on
-newer Debian versions, or `nginx-extras` on older ones). The library file,
-`prometheus.lua`, needs to be available in `LUA_PATH`. If this is the only Lua
-library you use, you can just point `lua_package_path` to the directory with
-this git repo checked out (see example below).
-
-OpenResty users will find this library in [opm](https://opm.openresty.org/). It
-is also available via
-[luarocks](https://luarocks.org/modules/knyar/nginx-lua-prometheus).
+```
+oppm register https://github.com/gelraen/OpenComputers-prometheus
+oppm install prometheus
+```
 
 ## Quick start guide
+
+```lua
+-- Initialize with pushgateway endpoint and a set of grouping labels:
+local prom = prometheus.init("http://localhost:9091/metrics", {owner="someone"})
+
+--[[ Callback that is called once with a single argument - `Prometheus` object
+that will contain a bunch of metrics.
+
+Return value will be passed as is to `update` callback.
+]]
+local init = function(prom)
+  return {
+    count=prom:counter("test_counter", "Test counter", {"foo"}),
+  }
+end
+
+--[[ Callback that will be called on timer to update metric values.
+
+The only argument is the value returned by `init` callback.
+]]
+local update = function(metrics)
+  metrics.count:inc(1, {"a"})
+  metrics.count:inc(2, {"b"})
+end
+
+--[[ Every 60 seconds push new set of metric values. Labels passed in second
+argument are merged together with labels passed to prometheus.init() to create
+a set of grouping labels. This set is the going to be used in Pushgateway
+endpoint URL.
+]]
+prom:timer(60, {job="foobar"}, init, update)
+```
+
+TODO: update stuff below.
 
 To track request latency broken down by server name and request count
 broken down by server name and status, add the following to the `http` section
@@ -345,79 +374,17 @@ log_by_lua '
 
 ### Built-in metrics
 
-The module increments the `nginx_metric_errors_total` metric if it encounters
+The module increments the `metric_errors_total` metric if it encounters
 an error (for example, when `lua_shared_dict` becomes full). You might want
 to configure an alert on that metric.
 
-## Caveats
-
-### Large number of metrics
-
-Please keep in mind that all metrics stored by this library are kept in a
-single shared dictionary (`lua_shared_dict`). While exposing metrics the module
-has to list all dictionary keys, which has serious performance implications for
-dictionaries with large number of keys (in this case this means large number
-of metrics OR metrics with high label cardinality). Listing the keys has to
-lock the dictionary, which blocks all threads that try to access it (i.e.
-potentially all nginx worker threads).
-
-There is no elegant solution to this issue (besides keeping metrics in a
-separate storage system external to nginx), so for latency-critical servers you
-might want to keep the number of metrics (and distinct metric label values) to
-a minimum.
-
-### Usage in stream module
-
-For now, there is no way to share a dictionary between HTTP and Stream modules
-in Nginx. If you are using this library to collect metrics from stream module,
-you will need to configure a separate endpoint to return them. Here's an
-example.
-
-```
-server {
-  listen 9145;
-  content_by_lua '
-    local sock = assert(ngx.req.socket(true))
-    local data = sock:receive()
-    local location = "GET /metrics"
-    if string.sub(data, 1, string.len(location)) == location then
-      ngx.say("HTTP/1.1 200 OK")
-      ngx.say("Content-Type: text/plain")
-      ngx.say("")
-      ngx.say(table.concat(prometheus:metric_data(), ""))
-    else
-      ngx.say("HTTP/1.1 404 Not Found")
-    end
-  ';
-  }
-```
-
-## Development
-
-### Install dependencies for testing
-
-- `luarocks install luacheck`
-- `luarocks install luaunit`
-
-### Run tests
-
-- `luacheck --globals ngx -- prometheus.lua`
-- `lua prometheus_test.lua`
-
-### Releasing new version
-
-- update version in the `dist.ini`
-- rename `.rockspec` file and update version inside it
-- commit changes
-- push to luarocks: `luarocks upload nginx-lua-prometheus-0.20181120-1.rockspec`
-- upload to OPM: `opm build && opm upload`
-- create a new Git tag: `git tag 0.XXXXXXXX-X && git push origin 0.XXXXXXXX-X`
 
 ## Credits
 
 - Created and maintained by Anton Tolchanov (@knyar)
 - Metrix prefix support contributed by david birdsong (@davidbirdsong)
 - Gauge support contributed by Cosmo Petrich (@cosmopetrich)
+- Adapted to OpenComputers by Max Ignatenko (@gelraen)
 
 ## License
 

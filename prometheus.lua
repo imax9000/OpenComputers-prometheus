@@ -320,29 +320,24 @@ local function check_metric_and_label_names(metric_name, label_names)
   end
 end
 
+local function log_err(...)
+  io.stderr:write(string.format(...) .. "\n")
+end
+
 -- Initialize the module.
 --
 -- This should be called once from the `init_by_lua` section in nginx
 -- configuration.
 --
 -- Args:
---   dict_name: (string) name of the nginx shared dictionary which will be
---     used to store all metrics
 --   prefix: (optional string) if supplied, prefix is added to all
 --   metric names on output
 --
 -- Returns:
 --   an object that should be used to register metrics.
-function Prometheus.init(dict_name, prefix)
+function Prometheus.init(prefix)
   local self = setmetatable({}, Prometheus)
-  dict_name = dict_name or "prometheus_metrics"
-  self.dict = ngx.shared[dict_name]
-  if self.dict == nil then
-    ngx.log(ngx.ERR,
-      "Dictionary '", dict_name, "' does not seem to exist. ",
-      "Please define the dictionary using `lua_shared_dict`.")
-    return self
-  end
+  self.dict = {}
   self.help = {}
   if prefix then
     self.prefix = prefix
@@ -355,15 +350,15 @@ function Prometheus.init(dict_name, prefix)
   self.bucket_format = {}
   self.initialized = true
 
-  self:counter("nginx_metric_errors_total",
-    "Number of nginx-lua-prometheus errors")
-  self.dict:set("nginx_metric_errors_total", 0)
+  self.error_counter = self:counter("metric_errors_total",
+    "Number of errors in prometheus library")
+  self.error_counter:inc(0)
   return self
 end
 
 function Prometheus:log_error(...)
-  ngx.log(ngx.ERR, ...)
-  self.dict:incr("nginx_metric_errors_total", 1)
+  log_err(...)
+  self.error_counter:inc()
 end
 
 function Prometheus:log_error_kv(key, value, err)
@@ -383,7 +378,7 @@ end
 --   a Counter object.
 function Prometheus:counter(name, description, label_names)
   if not self.initialized then
-    ngx.log(ngx.ERR, "Prometheus module has not been initialized")
+    log_err("Prometheus module has not been initialized")
     return
   end
 
@@ -416,7 +411,7 @@ end
 --   a Gauge object.
 function Prometheus:gauge(name, description, label_names)
   if not self.initialized then
-    ngx.log(ngx.ERR, "Prometheus module has not been initialized")
+    log_err("Prometheus module has not been initialized")
     return
   end
 
@@ -450,7 +445,7 @@ end
 --   a Histogram object.
 function Prometheus:histogram(name, description, label_names, buckets)
   if not self.initialized then
-    ngx.log(ngx.ERR, "Prometheus module has not been initialized")
+    log_err("Prometheus module has not been initialized")
     return
   end
 
@@ -480,10 +475,7 @@ end
 -- This overwrites existing values, so it should only be used when initializing
 -- metrics or when explicitely overwriting the previous value of a metric.
 function Prometheus:set_key(key, value)
-  local ok, err = self.dict:safe_set(key, value)
-  if not ok then
-    self:log_error_kv(key, value, err)
-  end
+  self.dict[key] = value
 end
 
 -- Increment a given metric by `value`.
@@ -498,20 +490,12 @@ function Prometheus:inc(name, label_names, label_values, value)
   local key = full_metric_name(name, label_names, label_values)
   if value == nil then value = 1 end
 
-  local newval, err = self.dict:incr(key, value)
-  if newval then
-    return
-  end
-  -- Yes, this looks like a race, so I guess we might under-report some values
-  -- when multiple workers simultaneously try to create the same metric.
-  -- Hopefully this does not happen too often (shared dictionary does not get
-  -- reset during configuation reload).
-  if err == "not found" then
+  local oldval = self.dict[key]
+  if oldval == nil then
     self:set_key(key, value)
     return
   end
-  -- Unexpected error
-  self:log_error_kv(key, value, err)
+  self.dict[key] = oldval + value
 end
 
 -- Set the current value of a gauge to `value`
@@ -562,16 +546,12 @@ end
 -- Delete all metrics in a gauge or counter. If this gauge or counter have labels, it
 --   will delete all the metrics with different label values.
 function Prometheus:reset(name)
-  local keys = self.dict:get_keys(0)
-  for _, key in ipairs(keys) do
-    local value, err = self.dict:get(key)
-    if value then
+  for key, value in pairs(self.dict) do
+    if value ~= nil then
       local short_name = short_metric_name(key)
       if name == short_name then
         self:set_key(key, nil)
       end
-    else
-      self:log_error("Error getting '", key, "': ", err)
     end
   end
 end
@@ -583,19 +563,22 @@ end
 --   Prometheus.
 function Prometheus:metric_data()
   if not self.initialized then
-    ngx.log(ngx.ERR, "Prometheus module has not been initialized")
+    log_err("Prometheus module has not been initialized")
     return
   end
 
-  local keys = self.dict:get_keys(0)
   -- Prometheus server expects buckets of a histogram to appear in increasing
   -- numerical order of their label values.
+  local keys = {}
+  for key, _ in pairs(self.dict) do
+    table.insert(keys, key)
+  end
   table.sort(keys)
 
   local seen_metrics = {}
   local output = {}
   for _, key in ipairs(keys) do
-    local value, err = self.dict:get(key)
+    local value = self.dict[key]
     if value then
       local short_name = short_metric_name(key)
       if not seen_metrics[short_name] then
@@ -621,14 +604,69 @@ function Prometheus:metric_data()
   return output
 end
 
--- Present all metrics in a text format compatible with Prometheus.
---
--- This function should be used to expose the metrics on a separate HTTP page.
--- It will get the metrics from the dictionary, sort them, and expose them
--- aling with TYPE and HELP comments.
-function Prometheus:collect()
-  ngx.header.content_type = "text/plain"
-  ngx.print(self:metric_data())
+--[[
+OpenComputers-specific stuff below.
+]]
+
+local event = require("event")
+local internet = require("internet")
+
+local PrometheusFactory = {}
+
+local function get_pushgateway_endpoint(address, global_labels, handler_labels)
+  local labels = {}
+  for k,v in pairs(handler_labels) do
+    labels[k] = v
+  end
+  -- Global labels override more specific ones.
+  for k,v in pairs(global_labels) do
+    labels[k] = v
+  end
+  -- Job label is mandatory, ensure that it is set.
+  if labels['job'] == nil then
+    labels['job'] = 'opencomputers'
+  end
+  local endpoint = string.format("%s/job/%s", address, labels['job'])
+  for label, value in pairs(labels) do
+    if label ~= 'job' then
+      endpoint = endpoint .. string.format("/%s/%s", label, value)
+    end
+  end
+  return endpoint
 end
 
-return Prometheus
+function PrometheusFactory:timer(interval, labels, init, update, prefix)
+  local prom = Prometheus.init(prefix)
+  local endpoint = get_pushgateway_endpoint(self.address, self.labels, labels)
+  
+  local userdata = init(prom)
+
+  local callback = function()
+    update(userdata)
+
+    local payload = ""
+    for _, line in ipairs(prom:metric_data()) do
+      payload = payload .. line
+    end
+    local handle = internet.request(endpoint, payload, {}, "PUT")
+    local resp_code, message, _ = handle.response()
+    if resp_code ~= 200 then
+      io.stderr:write(string.format("Request to pushgateway returned unexpected code %d: %s\n", resp_code, message))
+    end
+  end
+
+  event.timer(interval, callback, math.huge)
+end
+
+local PrometheusModule = {}
+
+function PrometheusModule.init(address, global_labels)
+  local factory = {
+    address=address,
+    labels=global_labels,
+  }
+  setmetatable(factory, {__index=PrometheusFactory})
+  return factory
+end
+
+return PrometheusModule

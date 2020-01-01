@@ -639,10 +639,18 @@ function PrometheusFactory:timer(interval, labels, init, update, prefix)
   local prom = Prometheus.init(prefix)
   local endpoint = get_pushgateway_endpoint(self.address, self.labels, labels)
   
-  local userdata = init(prom)
+  local ok, userdata = pcall(init, prom)
+  if not ok then
+    log_err("Init callback failed: %s", userdata)
+    return
+  end
 
   local callback = function()
-    update(userdata)
+    local ok, error_msg = pcall(update, userdata)
+    if not ok then
+      log_err("Update callback failed: %s", error_msg)
+      return
+    end
 
     local payload = ""
     for _, line in ipairs(prom:metric_data()) do
@@ -651,11 +659,18 @@ function PrometheusFactory:timer(interval, labels, init, update, prefix)
     local handle = internet.request(endpoint, payload, {}, "PUT")
     local resp_code, message, _ = handle.response()
     if resp_code ~= 200 then
-      io.stderr:write(string.format("Request to pushgateway returned unexpected code %d: %s\n", resp_code, message))
+      log_err("Request to pushgateway returned unexpected code %d: %s\n", resp_code, message)
     end
   end
 
-  event.timer(interval, callback, math.huge)
+  table.insert(self.timers, event.timer(interval, callback, math.huge))
+end
+
+function PrometheusFactory:stop()
+  for i, timer in ipairs(self.timers) do
+    event.cancel(timer)
+    self.timers[i] = nil
+  end
 end
 
 local PrometheusModule = {}
@@ -664,6 +679,7 @@ function PrometheusModule.init(address, global_labels)
   local factory = {
     address=address,
     labels=global_labels,
+    timers={},
   }
   setmetatable(factory, {__index=PrometheusFactory})
   return factory

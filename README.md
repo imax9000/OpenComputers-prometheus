@@ -6,7 +6,7 @@ Pushgateway.
 
 ## Installation
 
-```
+```sh
 oppm register https://github.com/gelraen/OpenComputers-prometheus
 oppm install prometheus
 ```
@@ -73,7 +73,7 @@ Returns a `prometheusFactory` object that should be used to configure periodic
 pushes.
 
 Example:
-```
+```lua
 local prometheus = require("prometheus").init("http://localhost:9091/metrics", {player="yourname"})
 ```
 
@@ -102,7 +102,7 @@ just `reset()` and populate the metric from scratch.
 
 
 Example:
-```
+```lua
 prometheus:timer(1, {job="foobar"}, function(prom)
   return {
     count=prom:counter("test_counter", "Test counter", {"foo"}),

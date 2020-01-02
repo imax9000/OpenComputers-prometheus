@@ -69,7 +69,8 @@ Initializes the module.
   up in the full URL when metrics are pushed to pushgateway.
 
 
-Returns a `prometheusFactory` object that should be used to register metrics.
+Returns a `prometheusFactory` object that should be used to configure periodic
+pushes.
 
 Example:
 ```

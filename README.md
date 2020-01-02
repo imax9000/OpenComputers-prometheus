@@ -4,9 +4,6 @@ This is a Lua library that can be used with OpenComputers in Minecraft to keep
 track of metrics and push them to [Prometheus](https://prometheus.io)
 Pushgateway.
 
-WARNING: it's still in "I just got it working" state, so there are some sharp
-edges.
-
 ## Installation
 
 ```
@@ -16,16 +13,18 @@ oppm install prometheus
 
 ## Quick start guide
 
+Example rc script:
+
 ```lua
 -- Initialize with pushgateway endpoint and a set of grouping labels:
-local prom = prometheus.init("http://localhost:9091/metrics", {owner="someone"})
+local prometheus = prometheus.init("http://localhost:9091/metrics", {player="someone"})
 
 --[[ Callback that is called once with a single argument - `Prometheus` object
 that will contain a bunch of metrics.
 
 Return value will be passed as is to `update` callback.
 ]]
-local init = function(prom)
+local function init(prom)
   return {
     count=prom:counter("test_counter", "Test counter", {"foo"}),
   }
@@ -35,111 +34,96 @@ end
 
 The only argument is the value returned by `init` callback.
 ]]
-local update = function(metrics)
+local function update(metrics)
   metrics.count:inc(1, {"a"})
   metrics.count:inc(2, {"b"})
 end
 
---[[ Every 60 seconds push new set of metric values. Labels passed in second
-argument are merged together with labels passed to prometheus.init() to create
-a set of grouping labels. This set is the going to be used in Pushgateway
-endpoint URL.
-]]
-prom:timer(60, {job="foobar"}, init, update)
+function start()
+  --[[ Every 60 seconds push new set of metric values. Labels passed in second
+  argument are merged together with labels passed to prometheus.init() to create
+  a set of grouping labels. This set is the going to be used in Pushgateway
+  endpoint URL.
+  ]]
+  prometheus:timer(60, {job="foobar"}, init, update)
+end
+
+function stop()
+  prometheus:stop()
+end
 ```
-
-TODO: update stuff below.
-
-To track request latency broken down by server name and request count
-broken down by server name and status, add the following to the `http` section
-of `nginx.conf`:
-
-```
-lua_shared_dict prometheus_metrics 10M;
-lua_package_path "/path/to/nginx-lua-prometheus/?.lua";
-init_by_lua '
-  prometheus = require("prometheus").init("prometheus_metrics")
-  metric_requests = prometheus:counter(
-    "nginx_http_requests_total", "Number of HTTP requests", {"host", "status"})
-  metric_latency = prometheus:histogram(
-    "nginx_http_request_duration_seconds", "HTTP request latency", {"host"})
-  metric_connections = prometheus:gauge(
-    "nginx_http_connections", "Number of HTTP connections", {"state"})
-';
-log_by_lua '
-  metric_requests:inc(1, {ngx.var.server_name, ngx.var.status})
-  metric_latency:observe(tonumber(ngx.var.request_time), {ngx.var.server_name})
-';
-```
-
-This:
-* configures a shared dictionary for your metrics called `prometheus_metrics`
-  with a 10MB size limit;
-* registers a counter called `nginx_http_requests_total` with two labels:
-  `host` and `status`;
-* registers a histogram called `nginx_http_request_duration_seconds` with one
-  label `host`;
-* registers a gauge called `nginx_http_connections` with one label `state`;
-* on each HTTP request measures its latency, recording it in the histogram and
-  increments the counter, setting current server name as the `host` label and
-  HTTP status code as the `status` label.
-
-Last step is to configure a separate server that will expose the metrics.
-Please make sure to only make it reachable from your Prometheus server:
-
-```
-server {
-  listen 9145;
-  allow 192.168.0.0/16;
-  deny all;
-  location /metrics {
-    content_by_lua '
-      metric_connections:set(ngx.var.connections_reading, {"reading"})
-      metric_connections:set(ngx.var.connections_waiting, {"waiting"})
-      metric_connections:set(ngx.var.connections_writing, {"writing"})
-      prometheus:collect()
-    ';
-  }
-}
-```
-
-Metrics will be available at `http://your.nginx:9145/metrics`. Note that the
-gauge metric in this example contains values obtained from nginx global state,
-so they get set immediately before metrics are returned to the client.
-
-If you experience problems indicating that nginx doesn't know how to interpret
-lua-commands and you use an external module for nginx-lua-support (e.g. the
-`libnginx-mod-http-lua` package on Debian) try adding
-
-    load_module modules/ndk_http_module.so;
-    load_module modules/ngx_http_lua_module.so;
-
-to the beginning of `nginx.conf` to ensure the modules are loaded.
-
 
 ## API reference
 
 ### init()
 
-**syntax:** require("prometheus").init(*dict_name*, [*prefix*])
+**syntax:** require("prometheus").init(*pushgateway_url*, [*grouping_labels*])
 
-Initializes the module. This should be called once from the
-[init_by_lua](https://github.com/openresty/lua-nginx-module#init_by_lua)
-section in nginx configuration.
+Initializes the module.
 
-* `dict_name` is the name of the nginx shared dictionary which will be used to
-  store all metrics. Defaults to `prometheus_metrics` if not specified.
-* `prefix` is an optional string which will be prepended to metric names on output
+* `pushgateway_url` is the address of pushgateway to use, e.g.
+  `"http://localhost:9091/metrics"`. If your pushgateway is on the local
+  network (that is, you're not accessing it over public internet), be sure to
+  remove it's address from a blacklist in OpenComputers config on your server.
+* `grouping_labels` is an optional dict with global gropuing labels - they end
+  up in the full URL when metrics are pushed to pushgateway.
 
 
-Returns a `prometheus` object that should be used to register metrics.
+Returns a `prometheusFactory` object that should be used to register metrics.
 
 Example:
 ```
-init_by_lua '
-  prometheus = require("prometheus").init("prometheus_metrics")
-';
+local prometheus = require("prometheus").init("http://localhost:9091/metrics", {player="yourname"})
 ```
+
+### prometheusFactory:timer()
+
+**syntax:** prometheus:timer(*interval*, *grouping_labels*, *init_cb*, *update_cb*, [*prefix*])
+
+Starts a periodic push of metrics.
+
+Metrics are pushed with `PUT` HTTP method, so every push will completely
+*replace* all metrics pushed earlier with the same grouping labels. That is, you
+don't have to worry about cleaning up stale values in multi-dimensional metrics,
+just `reset()` and populate the metric from scratch.
+
+* `interval` is the push interval in seconds.
+* `grouping_labels` is a dict with additional grouping labels. It gets merged
+  with `grouping_labels` passed to `init()`; if `job` label is not present - it
+  gets added automatically; and then the final list together with
+  `pushgateway_url` gets transformed into full URL used to push metrics.
+* `init_cb` is a function that gets called once, with a new `prometheus` object
+  as a single argument. This callback can create metrics using methods described
+  below and return a value that is passed to `update_cb`.
+* `update_cb` is a callback that is called before every push to update metric
+  values.
+* `prefix` is an optional string to prefix metric names with.
+
+
+Example:
+```
+prometheus:timer(1, {job="foobar"}, function(prom)
+  return {
+    count=prom:counter("test_counter", "Test counter", {"foo"}),
+  }
+end, function(metrics)
+  metrics.count:inc(1, {"a"})
+  metrics.count:inc(2, {"b"})
+end)
+```
+
+### prometheusFactory:stop()
+
+**syntax**: prometheus:stop()
+
+Stops any periodic pushes started before.
+
+
+## API inherited from [nginx-lua-prometheus](https://github.com/knyar/nginx-lua-prometheus)
+
+I haven't got around yet to updating examples and cleaning up references to
+Nginx, but it still provides a lot of information that applies to this
+OpenComputers library.
 
 ### prometheus:counter()
 
@@ -223,24 +207,6 @@ init_by_lua '
     "nginx_http_response_size_bytes", "Size of HTTP responses", nil,
     {10,100,1000,10000,100000,1000000})
 ';
-```
-
-### prometheus:collect()
-
-**syntax:** prometheus:collect()
-
-Presents all metrics in a text format compatible with Prometheus. This should be
-called in
-[content_by_lua](https://github.com/openresty/lua-nginx-module#content_by_lua)
-to expose the metrics on a separate HTTP page.
-
-Example:
-```
-location /metrics {
-  content_by_lua 'prometheus:collect()';
-  allow 192.168.0.0/16;
-  deny all;
-}
 ```
 
 ### prometheus:metric_data()

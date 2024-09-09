@@ -7,7 +7,7 @@ Pushgateway.
 ## Installation
 
 ```sh
-oppm register https://github.com/gelraen/OpenComputers-prometheus
+oppm register imax9000/OpenComputers-prometheus
 oppm install prometheus
 ```
 
